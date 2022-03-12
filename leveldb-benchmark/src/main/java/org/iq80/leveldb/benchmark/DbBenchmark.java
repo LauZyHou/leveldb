@@ -630,6 +630,7 @@ public class DbBenchmark
     public static void main(String[] args)
             throws Exception
     {
+        System.out.println("Test start...");
         Map<Flag, Object> flags = new EnumMap<>(Flag.class);
         for (Flag flag : Flag.values()) {
             flags.put(flag, flag.getDefaultValue());

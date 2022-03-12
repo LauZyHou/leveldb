@@ -33,6 +33,9 @@ import org.iq80.leveldb.impl.Filename.FileInfo;
 import org.iq80.leveldb.impl.Filename.FileType;
 import org.iq80.leveldb.impl.MemTable.MemTableIterator;
 import org.iq80.leveldb.impl.WriteBatchImpl.Handler;
+import org.iq80.leveldb.impl.hotcold.HCMemTable;
+import org.iq80.leveldb.impl.hotcold.HCSys;
+import org.iq80.leveldb.impl.hotcold.Record;
 import org.iq80.leveldb.table.BytewiseComparator;
 import org.iq80.leveldb.table.CustomUserComparator;
 import org.iq80.leveldb.table.TableBuilder;
@@ -54,6 +57,7 @@ import java.lang.Thread.UncaughtExceptionHandler;
 import java.nio.channels.FileChannel;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map.Entry;
 import java.util.concurrent.Callable;
@@ -99,9 +103,14 @@ public class DbImpl
 
     private LogWriter log;
 
+    // 原始memtable
     private MemTable memTable;
+    // 原始memtable的imm
     private MemTable immutableMemTable;
+    // 冷热系统
+    private HCSys hcSys;
 
+    // 原始memtable的比较器
     private final InternalKeyComparator internalKeyComparator;
 
     private volatile Throwable backgroundException;
@@ -133,9 +142,14 @@ public class DbImpl
         else {
             userComparator = new BytewiseComparator();
         }
+        // 创建比较器
         internalKeyComparator = new InternalKeyComparator(userComparator);
+        // 创建维护的memtable
         memTable = new MemTable(internalKeyComparator);
+        // imm memtable置为空
         immutableMemTable = null;
+        // 初始化冷热系统
+        hcSys = new HCSys(userComparator);
 
         ThreadFactory compactionThreadFactory = new ThreadFactoryBuilder()
                 .setNameFormat("leveldb-compaction-%s")
@@ -546,7 +560,7 @@ public class DbImpl
                 if (memTable == null) {
                     memTable = new MemTable(internalKeyComparator);
                 }
-                writeBatch.forEach(new InsertIntoHandler(memTable, sequenceBegin));
+                writeBatch.forEach(new InsertIntoHandler(memTable, sequenceBegin, null));
 
                 // update the maxSequence
                 long lastSequence = sequenceBegin + updateSize - 1;
@@ -704,7 +718,7 @@ public class DbImpl
                 }
 
                 // Update memtable
-                updates.forEach(new InsertIntoHandler(memTable, sequenceBegin));
+                updates.forEach(new InsertIntoHandler(memTable, sequenceBegin, this.hcSys));
             }
             else {
                 sequenceEnd = versions.getLastSequence();
@@ -1358,23 +1372,50 @@ public class DbImpl
     {
         private long sequence;
         private final MemTable memTable;
+        // 增添的冷热系统
+        private final HCSys hcSys;
 
-        public InsertIntoHandler(MemTable memTable, long sequenceBegin)
+        public InsertIntoHandler(MemTable memTable, long sequenceBegin, HCSys hcSys)
         {
             this.memTable = memTable;
             this.sequence = sequenceBegin;
+            this.hcSys = hcSys;
         }
 
         @Override
         public void put(Slice key, Slice value)
         {
-            memTable.add(sequence++, VALUE, key, value);
+            // 没有置备冷热系统时，直接走原来的path（仅用于原生recover过程）
+            if (this.hcSys == null) {
+                this.memTable.add(sequence++, VALUE, key, value);
+                return;
+            }
+            // 在冷热系统中变更记录，并返回需要刷盘的冷数据（如果有
+            Record record = new Record(key, value, VALUE, sequence++);
+            LinkedList<Record> coldDataToFlushDisk = this.hcSys.PutRecord(record);
+            if (coldDataToFlushDisk.isEmpty()) return;
+            // 至此，需要对冷数据刷盘
+            for (Record item: coldDataToFlushDisk) {
+                this.memTable.add(item.sequence, item.valueType, item.userKey, item.value);
+            }
         }
 
         @Override
         public void delete(Slice key)
         {
-            memTable.add(sequence++, DELETION, key, Slices.EMPTY_SLICE);
+            // 没有置备冷热系统时，直接走原来的path（仅用于原生recover过程）
+            if (this.hcSys == null) {
+                this.memTable.add(sequence++, DELETION, key, Slices.EMPTY_SLICE);
+                return;
+            }
+            // 在冷热系统中变更记录，并返回需要刷盘的冷数据（如果有
+            Record record = new Record(key, Slices.EMPTY_SLICE, DELETION, sequence++);
+            LinkedList<Record> coldDataToFlushDisk = this.hcSys.PutRecord(record);
+            if (coldDataToFlushDisk.isEmpty()) return;
+            // 至此，需要对冷数据刷盘
+            for (Record item: coldDataToFlushDisk) {
+                this.memTable.add(item.sequence, item.valueType, item.userKey, item.value);
+            }
         }
     }
 
